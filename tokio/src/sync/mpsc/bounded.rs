@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 /// To convert the `Sender` into a `Sink` or use it in a poll function, you can
 /// use the [`PollSender`] utility.
 ///
-/// [`PollSender`]: https://docs.rs/tokio-util/0.6/tokio_util/sync/struct.PollSender.html
+/// [`PollSender`]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.PollSender.html
 pub struct Sender<T> {
     chan: chan::Tx<T, Semaphore>,
 }
@@ -326,6 +326,7 @@ impl<T> Receiver<T> {
     /// ```
     #[track_caller]
     #[cfg(feature = "sync")]
+    #[cfg_attr(docsrs, doc(alias = "recv_blocking"))]
     pub fn blocking_recv(&mut self) -> Option<T> {
         crate::future::block_on(self.recv())
     }
@@ -438,7 +439,11 @@ impl<T> Sender<T> {
     ///
     /// If `send` is used as the event in a [`tokio::select!`](crate::select)
     /// statement and some other branch completes first, then it is guaranteed
-    /// that the message was not sent.
+    /// that the message was not sent. **However, in that case, the message
+    /// is dropped and will be lost.**
+    ///
+    /// To avoid losing messages, use [`reserve`](Self::reserve) to reserve
+    /// capacity, then use the returned [`Permit`] to send the message.
     ///
     /// This channel uses a queue to ensure that calls to `send` and `reserve`
     /// complete in the order they were requested.  Cancelling a call to
@@ -696,6 +701,7 @@ impl<T> Sender<T> {
     /// ```
     #[track_caller]
     #[cfg(feature = "sync")]
+    #[cfg_attr(docsrs, doc(alias = "send_blocking"))]
     pub fn blocking_send(&self, value: T) -> Result<(), SendError<T>> {
         crate::future::block_on(self.send(value))
     }
@@ -859,6 +865,8 @@ impl<T> Sender<T> {
     }
 
     async fn reserve_inner(&self) -> Result<(), SendError<()>> {
+        crate::trace::async_trace_leaf().await;
+
         match self.chan.semaphore().semaphore.acquire(1).await {
             Ok(_) => Ok(()),
             Err(_) => Err(SendError(())),

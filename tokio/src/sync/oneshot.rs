@@ -12,6 +12,10 @@
 //! Since the `send` method is not async, it can be used anywhere. This includes
 //! sending between two runtimes, and using it from non-async code.
 //!
+//! If the [`Receiver`] is closed before receiving a message which has already
+//! been sent, the message will remain in the channel until the receiver is
+//! dropped, at which point the message will be dropped immediately.
+//!
 //! # Examples
 //!
 //! ```
@@ -786,6 +790,8 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        ready!(crate::trace::trace_leaf(cx));
+
         // Keep track of task budget
         let coop = ready!(crate::runtime::coop::poll_proceed(cx));
 
@@ -795,7 +801,7 @@ impl<T> Sender<T> {
 
         if state.is_closed() {
             coop.made_progress();
-            return Poll::Ready(());
+            return Ready(());
         }
 
         if state.is_tx_task_set() {
@@ -1056,6 +1062,7 @@ impl<T> Receiver<T> {
     /// ```
     #[track_caller]
     #[cfg(feature = "sync")]
+    #[cfg_attr(docsrs, doc(alias = "recv_blocking"))]
     pub fn blocking_recv(self) -> Result<T, RecvError> {
         crate::future::block_on(self)
     }
@@ -1125,6 +1132,7 @@ impl<T> Inner<T> {
     }
 
     fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+        ready!(crate::trace::trace_leaf(cx));
         // Keep track of task budget
         let coop = ready!(crate::runtime::coop::poll_proceed(cx));
 

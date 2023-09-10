@@ -173,7 +173,7 @@ const KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// Tasks will be scheduled as non-mandatory, meaning they may not get executed
 /// in case of runtime shutdown.
 #[track_caller]
-#[cfg_attr(tokio_wasi, allow(dead_code))]
+#[cfg_attr(target_os = "wasi", allow(dead_code))]
 pub(crate) fn spawn_blocking<F, R>(func: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -371,7 +371,9 @@ impl Spawner {
                 task.name = %name.unwrap_or_default(),
                 task.id = id.as_u64(),
                 "fn" = %std::any::type_name::<F>(),
-                spawn.location = %format_args!("{}:{}:{}", location.file(), location.line(), location.column()),
+                loc.file = location.file(),
+                loc.line = location.line(),
+                loc.col = location.column(),
             );
             fut.instrument(span)
         };

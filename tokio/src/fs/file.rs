@@ -3,7 +3,7 @@
 //! [`File`]: File
 
 use self::State::*;
-use crate::fs::asyncify;
+use crate::fs::{asyncify, OpenOptions};
 use crate::io::blocking::Buf;
 use crate::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use crate::sync::Mutex;
@@ -124,8 +124,6 @@ impl File {
     ///
     /// See [`OpenOptions`] for more details.
     ///
-    /// [`OpenOptions`]: super::OpenOptions
-    ///
     /// # Errors
     ///
     /// This function will return an error if called from outside of the Tokio
@@ -167,8 +165,6 @@ impl File {
     ///
     /// See [`OpenOptions`] for more details.
     ///
-    /// [`OpenOptions`]: super::OpenOptions
-    ///
     /// # Errors
     ///
     /// Results in an error if called from outside of the Tokio runtime or if
@@ -197,6 +193,37 @@ impl File {
         let path = path.as_ref().to_owned();
         let std_file = asyncify(move || StdFile::create(path)).await?;
         Ok(File::from_std(std_file))
+    }
+
+    /// Returns a new [`OpenOptions`] object.
+    ///
+    /// This function returns a new `OpenOptions` object that you can use to
+    /// open or create a file with specific options if `open()` or `create()`
+    /// are not appropriate.
+    ///
+    /// It is equivalent to `OpenOptions::new()`, but allows you to write more
+    /// readable code. Instead of
+    /// `OpenOptions::new().append(true).open("example.log")`,
+    /// you can write `File::options().append(true).open("example.log")`. This
+    /// also avoids the need to import `OpenOptions`.
+    ///
+    /// See the [`OpenOptions::new`] function for more details.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tokio::fs::File;
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// # async fn dox() -> std::io::Result<()> {
+    /// let mut f = File::options().append(true).open("example.log").await?;
+    /// f.write_all(b"new line\n").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn options() -> OpenOptions {
+        OpenOptions::new()
     }
 
     /// Converts a [`std::fs::File`][std] to a [`tokio::fs::File`][file].
@@ -399,6 +426,7 @@ impl File {
     /// # }
     /// ```
     pub async fn try_clone(&self) -> io::Result<File> {
+        self.inner.lock().await.complete_inflight().await;
         let std = self.std.clone();
         let std_file = asyncify(move || std.try_clone()).await?;
         Ok(File::from_std(std_file))
@@ -498,6 +526,7 @@ impl AsyncRead for File {
         cx: &mut Context<'_>,
         dst: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        ready!(crate::trace::trace_leaf(cx));
         let me = self.get_mut();
         let inner = me.inner.get_mut();
 
@@ -594,6 +623,7 @@ impl AsyncSeek for File {
     }
 
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        ready!(crate::trace::trace_leaf(cx));
         let inner = self.inner.get_mut();
 
         loop {
@@ -629,6 +659,7 @@ impl AsyncWrite for File {
         cx: &mut Context<'_>,
         src: &[u8],
     ) -> Poll<io::Result<usize>> {
+        ready!(crate::trace::trace_leaf(cx));
         let me = self.get_mut();
         let inner = me.inner.get_mut();
 
@@ -694,12 +725,89 @@ impl AsyncWrite for File {
         }
     }
 
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        ready!(crate::trace::trace_leaf(cx));
+        let me = self.get_mut();
+        let inner = me.inner.get_mut();
+
+        if let Some(e) = inner.last_write_err.take() {
+            return Ready(Err(e.into()));
+        }
+
+        loop {
+            match inner.state {
+                Idle(ref mut buf_cell) => {
+                    let mut buf = buf_cell.take().unwrap();
+
+                    let seek = if !buf.is_empty() {
+                        Some(SeekFrom::Current(buf.discard_read()))
+                    } else {
+                        None
+                    };
+
+                    let n = buf.copy_from_bufs(bufs);
+                    let std = me.std.clone();
+
+                    let blocking_task_join_handle = spawn_mandatory_blocking(move || {
+                        let res = if let Some(seek) = seek {
+                            (&*std).seek(seek).and_then(|_| buf.write_to(&mut &*std))
+                        } else {
+                            buf.write_to(&mut &*std)
+                        };
+
+                        (Operation::Write(res), buf)
+                    })
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::Other, "background task failed")
+                    })?;
+
+                    inner.state = Busy(blocking_task_join_handle);
+
+                    return Ready(Ok(n));
+                }
+                Busy(ref mut rx) => {
+                    let (op, buf) = ready!(Pin::new(rx).poll(cx))?;
+                    inner.state = Idle(Some(buf));
+
+                    match op {
+                        Operation::Read(_) => {
+                            // We don't care about the result here. The fact
+                            // that the cursor has advanced will be reflected in
+                            // the next iteration of the loop
+                            continue;
+                        }
+                        Operation::Write(res) => {
+                            // If the previous write was successful, continue.
+                            // Otherwise, error.
+                            res?;
+                            continue;
+                        }
+                        Operation::Seek(_) => {
+                            // Ignore the seek
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        ready!(crate::trace::trace_leaf(cx));
         let inner = self.inner.get_mut();
         inner.poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        ready!(crate::trace::trace_leaf(cx));
         self.poll_flush(cx)
     }
 }
@@ -726,23 +834,44 @@ impl std::os::unix::io::AsRawFd for File {
 }
 
 #[cfg(unix)]
+impl std::os::unix::io::AsFd for File {
+    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+        unsafe {
+            std::os::unix::io::BorrowedFd::borrow_raw(std::os::unix::io::AsRawFd::as_raw_fd(self))
+        }
+    }
+}
+
+#[cfg(unix)]
 impl std::os::unix::io::FromRawFd for File {
     unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> Self {
         StdFile::from_raw_fd(fd).into()
     }
 }
 
-#[cfg(windows)]
-impl std::os::windows::io::AsRawHandle for File {
-    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
-        self.std.as_raw_handle()
-    }
-}
+cfg_windows! {
+    use crate::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle, AsHandle, BorrowedHandle};
 
-#[cfg(windows)]
-impl std::os::windows::io::FromRawHandle for File {
-    unsafe fn from_raw_handle(handle: std::os::windows::io::RawHandle) -> Self {
-        StdFile::from_raw_handle(handle).into()
+    impl AsRawHandle for File {
+        fn as_raw_handle(&self) -> RawHandle {
+            self.std.as_raw_handle()
+        }
+    }
+
+    impl AsHandle for File {
+        fn as_handle(&self) -> BorrowedHandle<'_> {
+            unsafe {
+                BorrowedHandle::borrow_raw(
+                    AsRawHandle::as_raw_handle(self),
+                )
+            }
+        }
+    }
+
+    impl FromRawHandle for File {
+        unsafe fn from_raw_handle(handle: RawHandle) -> Self {
+            StdFile::from_raw_handle(handle).into()
+        }
     }
 }
 
@@ -750,8 +879,18 @@ impl Inner {
     async fn complete_inflight(&mut self) {
         use crate::future::poll_fn;
 
-        if let Err(e) = poll_fn(|cx| Pin::new(&mut *self).poll_flush(cx)).await {
-            self.last_write_err = Some(e.kind());
+        poll_fn(|cx| self.poll_complete_inflight(cx)).await
+    }
+
+    fn poll_complete_inflight(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        ready!(crate::trace::trace_leaf(cx));
+        match self.poll_flush(cx) {
+            Poll::Ready(Err(e)) => {
+                self.last_write_err = Some(e.kind());
+                Poll::Ready(())
+            }
+            Poll::Ready(Ok(())) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
         }
     }
 

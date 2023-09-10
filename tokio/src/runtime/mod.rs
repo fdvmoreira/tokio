@@ -156,9 +156,11 @@
 //! multi-thread scheduler spawns threads to schedule tasks and for `spawn_blocking`
 //! calls.
 //!
-//! While the `Runtime` is active, threads may shutdown after periods of being
-//! idle. Once `Runtime` is dropped, all runtime threads are forcibly shutdown.
-//! Any tasks that have not yet completed will be dropped.
+//! While the `Runtime` is active, threads may shut down after periods of being
+//! idle. Once `Runtime` is dropped, all runtime threads have usually been
+//! terminated, but in the presence of unstoppable spawned work are not
+//! guaranteed to have been terminated. See the
+//! [struct level documentation](Runtime#shutdown) for more details.
 //!
 //! [tasks]: crate::task
 //! [`Runtime`]: Runtime
@@ -173,7 +175,7 @@
 
 // At the top due to macros
 #[cfg(test)]
-#[cfg(not(tokio_wasm))]
+#[cfg(not(target_family = "wasm"))]
 #[macro_use]
 mod tests;
 
@@ -210,7 +212,7 @@ cfg_rt! {
     use config::Config;
 
     mod blocking;
-    #[cfg_attr(tokio_wasi, allow(unused_imports))]
+    #[cfg_attr(target_os = "wasi", allow(unused_imports))]
     pub(crate) use blocking::spawn_blocking;
 
     cfg_trace! {
@@ -224,12 +226,18 @@ cfg_rt! {
     mod builder;
     pub use self::builder::Builder;
     cfg_unstable! {
+        mod id;
+        #[cfg_attr(not(tokio_unstable), allow(unreachable_pub))]
+        pub use id::Id;
+
         pub use self::builder::UnhandledPanic;
         pub use crate::util::rand::RngSeed;
     }
 
-    mod defer;
-    pub(crate) use defer::Defer;
+    cfg_taskdump! {
+        pub mod dump;
+        pub use dump::Dump;
+    }
 
     mod handle;
     pub use handle::{EnterGuard, Handle, TryCurrentError};
@@ -242,9 +250,9 @@ cfg_rt! {
 
     cfg_metrics! {
         mod metrics;
-        pub use metrics::RuntimeMetrics;
+        pub use metrics::{RuntimeMetrics, HistogramScale};
 
-        pub(crate) use metrics::{MetricsBatch, SchedulerMetrics, WorkerMetrics};
+        pub(crate) use metrics::{MetricsBatch, SchedulerMetrics, WorkerMetrics, HistogramBuilder};
 
         cfg_net! {
         pub(crate) use metrics::IoDriverMetrics;
@@ -253,7 +261,7 @@ cfg_rt! {
 
     cfg_not_metrics! {
         pub(crate) mod metrics;
-        pub(crate) use metrics::{SchedulerMetrics, WorkerMetrics, MetricsBatch};
+        pub(crate) use metrics::{SchedulerMetrics, WorkerMetrics, MetricsBatch, HistogramBuilder};
     }
 
     /// After thread starts / before thread stops

@@ -1,10 +1,9 @@
 use crate::io::{Interest, PollEvented};
 use crate::net::unix::{SocketAddr, UnixStream};
 
-use std::convert::TryFrom;
 use std::fmt;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net;
 use std::path::Path;
 use std::task::{Context, Poll};
@@ -44,6 +43,7 @@ cfg_net_unix! {
     ///     }
     /// }
     /// ```
+    #[cfg_attr(docsrs, doc(alias = "uds"))]
     pub struct UnixListener {
         io: PollEvented<mio::net::UnixListener>,
     }
@@ -206,5 +206,11 @@ impl fmt::Debug for UnixListener {
 impl AsRawFd for UnixListener {
     fn as_raw_fd(&self) -> RawFd {
         self.io.as_raw_fd()
+    }
+}
+
+impl AsFd for UnixListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }

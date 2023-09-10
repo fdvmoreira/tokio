@@ -9,6 +9,10 @@ use std::time::Duration;
 cfg_rt_multi_thread! {
     use crate::runtime::Builder;
     use crate::runtime::scheduler::MultiThread;
+
+    cfg_unstable! {
+        use crate::runtime::scheduler::MultiThreadAlt;
+    }
 }
 
 /// The Tokio runtime.
@@ -24,31 +28,69 @@ cfg_rt_multi_thread! {
 ///
 /// # Shutdown
 ///
-/// Shutting down the runtime is done by dropping the value. The current
-/// thread will block until the shut down operation has completed.
+/// Shutting down the runtime is done by dropping the value, or calling
+/// [`shutdown_background`] or [`shutdown_timeout`].
 ///
-/// * Drain any scheduled work queues.
-/// * Drop any futures that have not yet completed.
-/// * Drop the reactor.
+/// Tasks spawned through [`Runtime::spawn`] keep running until they yield.
+/// Then they are dropped. They are not *guaranteed* to run to completion, but
+/// *might* do so if they do not yield until completion.
 ///
-/// Once the reactor has dropped, any outstanding I/O resources bound to
-/// that reactor will no longer function. Calling any method on them will
-/// result in an error.
+/// Blocking functions spawned through [`Runtime::spawn_blocking`] keep running
+/// until they return.
+///
+/// The thread initiating the shutdown blocks until all spawned work has been
+/// stopped. This can take an indefinite amount of time. The `Drop`
+/// implementation waits forever for this.
+///
+/// The [`shutdown_background`] and [`shutdown_timeout`] methods can be used if
+/// waiting forever is undesired. When the timeout is reached, spawned work that
+/// did not stop in time and threads running it are leaked. The work continues
+/// to run until one of the stopping conditions is fulfilled, but the thread
+/// initiating the shutdown is unblocked.
+///
+/// Once the runtime has been dropped, any outstanding I/O resources bound to
+/// it will no longer function. Calling any method on them will result in an
+/// error.
 ///
 /// # Sharing
 ///
-/// The Tokio runtime implements `Sync` and `Send` to allow you to wrap it
-/// in a `Arc`. Most fn take `&self` to allow you to call them concurrently
-/// across multiple threads.
+/// There are several ways to establish shared access to a Tokio runtime:
 ///
-/// Calls to `shutdown` and `shutdown_timeout` require exclusive ownership of
-/// the runtime type and this can be achieved via `Arc::try_unwrap` when only
-/// one strong count reference is left over.
+///  * Using an <code>[Arc]\<Runtime></code>.
+///  * Using a [`Handle`].
+///  * Entering the runtime context.
+///
+/// Using an <code>[Arc]\<Runtime></code> or [`Handle`] allows you to do various
+/// things with the runtime such as spawning new tasks or entering the runtime
+/// context. Both types can be cloned to create a new handle that allows access
+/// to the same runtime. By passing clones into different tasks or threads, you
+/// will be able to access the runtime from those tasks or threads.
+///
+/// The difference between <code>[Arc]\<Runtime></code> and [`Handle`] is that
+/// an <code>[Arc]\<Runtime></code> will prevent the runtime from shutting down,
+/// whereas a [`Handle`] does not prevent that. This is because shutdown of the
+/// runtime happens when the destructor of the `Runtime` object runs.
+///
+/// Calls to [`shutdown_background`] and [`shutdown_timeout`] require exclusive
+/// ownership of the `Runtime` type. When using an <code>[Arc]\<Runtime></code>,
+/// this can be achieved via [`Arc::try_unwrap`] when only one strong count
+/// reference is left over.
+///
+/// The runtime context is entered using the [`Runtime::enter`] or
+/// [`Handle::enter`] methods, which use a thread-local variable to store the
+/// current runtime. Whenever you are inside the runtime context, methods such
+/// as [`tokio::spawn`] will use the runtime whose context you are inside.
 ///
 /// [timer]: crate::time
 /// [mod]: index.html
 /// [`new`]: method@Self::new
 /// [`Builder`]: struct@Builder
+/// [`Handle`]: struct@Handle
+/// [`tokio::spawn`]: crate::spawn
+/// [`Arc::try_unwrap`]: std::sync::Arc::try_unwrap
+/// [Arc]: std::sync::Arc
+/// [`shutdown_background`]: method@Runtime::shutdown_background
+/// [`shutdown_timeout`]: method@Runtime::shutdown_timeout
 #[derive(Debug)]
 pub struct Runtime {
     /// Task scheduler
@@ -71,6 +113,9 @@ pub enum RuntimeFlavor {
     CurrentThread,
     /// The flavor that executes tasks across multiple threads.
     MultiThread,
+    /// The flavor that executes tasks across multiple threads.
+    #[cfg(tokio_unstable)]
+    MultiThreadAlt,
 }
 
 /// The runtime scheduler is either a multi-thread or a current-thread executor.
@@ -80,8 +125,12 @@ pub(super) enum Scheduler {
     CurrentThread(CurrentThread),
 
     /// Execute tasks across multiple threads.
-    #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+    #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
     MultiThread(MultiThread),
+
+    /// Execute tasks across multiple threads.
+    #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
+    MultiThreadAlt(MultiThreadAlt),
 }
 
 impl Runtime {
@@ -211,6 +260,7 @@ impl Runtime {
     ///     println!("now running on a worker thread");
     /// });
     /// # }
+    /// ```
     #[track_caller]
     pub fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
     where
@@ -226,6 +276,13 @@ impl Runtime {
     /// This runs the given future on the current thread, blocking until it is
     /// complete, and yielding its resolved result. Any tasks or timers
     /// which the future spawns internally will be executed on the runtime.
+    ///
+    /// # Non-worker future
+    ///
+    /// Note that the future required by this function does not run as a
+    /// worker. The expectation is that other tasks are spawned by the future here.
+    /// Awaiting on other futures from the future provided here will not
+    /// perform as fast as those spawned as workers.
     ///
     /// # Multi thread scheduler
     ///
@@ -268,6 +325,15 @@ impl Runtime {
     /// [handle]: fn@Handle::block_on
     #[track_caller]
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        #[cfg(all(
+            tokio_unstable,
+            tokio_taskdump,
+            feature = "rt",
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+        ))]
+        let future = super::task::trace::Trace::root(future);
+
         #[cfg(all(tokio_unstable, feature = "tracing"))]
         let future = crate::util::trace::task(
             future,
@@ -280,8 +346,10 @@ impl Runtime {
 
         match &self.scheduler {
             Scheduler::CurrentThread(exec) => exec.block_on(&self.handle.inner, future),
-            #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+            #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
             Scheduler::MultiThread(exec) => exec.block_on(&self.handle.inner, future),
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
+            Scheduler::MultiThreadAlt(exec) => exec.block_on(&self.handle.inner, future),
         }
     }
 
@@ -322,18 +390,9 @@ impl Runtime {
     }
 
     /// Shuts down the runtime, waiting for at most `duration` for all spawned
-    /// task to shutdown.
+    /// work to stop.
     ///
-    /// Usually, dropping a `Runtime` handle is sufficient as tasks are able to
-    /// shutdown in a timely fashion. However, dropping a `Runtime` will wait
-    /// indefinitely for all tasks to terminate, and there are cases where a long
-    /// blocking task has been spawned, which can block dropping `Runtime`.
-    ///
-    /// In this case, calling `shutdown_timeout` with an explicit wait timeout
-    /// can work. The `shutdown_timeout` will signal all tasks to shutdown and
-    /// will wait for at most `duration` for all spawned tasks to terminate. If
-    /// `timeout` elapses before all tasks are dropped, the function returns and
-    /// outstanding tasks are potentially leaked.
+    /// See the [struct level documentation](Runtime#shutdown) for more details.
     ///
     /// # Examples
     ///
@@ -362,7 +421,7 @@ impl Runtime {
         self.blocking_pool.shutdown(Some(duration));
     }
 
-    /// Shuts down the runtime, without waiting for any spawned tasks to shutdown.
+    /// Shuts down the runtime, without waiting for any spawned work to stop.
     ///
     /// This can be useful if you want to drop a runtime from within another runtime.
     /// Normally, dropping a runtime will block indefinitely for spawned blocking tasks
@@ -372,6 +431,8 @@ impl Runtime {
     /// Note however, that because we do not wait for any blocking tasks to complete, this
     /// may result in a resource leak (in that any blocking tasks are still running until they
     /// return.
+    ///
+    /// See the [struct level documentation](Runtime#shutdown) for more details.
     ///
     /// This function is equivalent to calling `shutdown_timeout(Duration::from_nanos(0))`.
     ///
@@ -403,8 +464,14 @@ impl Drop for Runtime {
                 let _guard = context::try_set_current(&self.handle.inner);
                 current_thread.shutdown(&self.handle.inner);
             }
-            #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+            #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
             Scheduler::MultiThread(multi_thread) => {
+                // The threaded scheduler drops its tasks on its worker threads, which is
+                // already in the runtime's context.
+                multi_thread.shutdown(&self.handle.inner);
+            }
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
+            Scheduler::MultiThreadAlt(multi_thread) => {
                 // The threaded scheduler drops its tasks on its worker threads, which is
                 // already in the runtime's context.
                 multi_thread.shutdown(&self.handle.inner);

@@ -26,7 +26,7 @@ pub(crate) struct Buf {
     pos: usize,
 }
 
-pub(crate) const MAX_BUF: usize = 16 * 1024;
+pub(crate) const MAX_BUF: usize = 2 * 1024 * 1024;
 
 #[derive(Debug)]
 enum State<T> {
@@ -275,6 +275,23 @@ cfg_fs! {
             self.pos = 0;
             self.buf.truncate(0);
             ret
+        }
+
+        pub(crate) fn copy_from_bufs(&mut self, bufs: &[io::IoSlice<'_>]) -> usize {
+            assert!(self.is_empty());
+
+            let mut rem = MAX_BUF;
+            for buf in bufs {
+                if rem == 0 {
+                    break
+                }
+
+                let len = buf.len().min(rem);
+                self.buf.extend_from_slice(&buf[..len]);
+                rem -= len;
+            }
+
+            MAX_BUF - rem
         }
     }
 }

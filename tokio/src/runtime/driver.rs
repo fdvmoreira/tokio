@@ -2,7 +2,10 @@
 
 // Eventually, this file will see significant refactoring / cleanup. For now, we
 // don't need to worry much about dead code with certain feature permutations.
-#![cfg_attr(not(feature = "full"), allow(dead_code))]
+#![cfg_attr(
+    any(not(all(tokio_unstable, feature = "full")), target_family = "wasm"),
+    allow(dead_code)
+)]
 
 use crate::runtime::park::{ParkThread, UnparkThread};
 
@@ -45,8 +48,7 @@ impl Driver {
 
         let clock = create_clock(cfg.enable_pause_time, cfg.start_paused);
 
-        let (time_driver, time_handle) =
-            create_time_driver(cfg.enable_time, io_stack, clock.clone());
+        let (time_driver, time_handle) = create_time_driver(cfg.enable_time, io_stack, &clock);
 
         Ok((
             Self { inner: time_driver },
@@ -57,6 +59,10 @@ impl Driver {
                 clock,
             },
         ))
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.inner.is_enabled()
     }
 
     pub(crate) fn park(&mut self, handle: &Handle) {
@@ -111,10 +117,8 @@ impl Handle {
                 .expect("A Tokio 1.x context was found, but timers are disabled. Call `enable_time` on the runtime builder to enable timers.")
         }
 
-        cfg_test_util! {
-            pub(crate) fn clock(&self) -> &Clock {
-                &self.clock
-            }
+        pub(crate) fn clock(&self) -> &Clock {
+            &self.clock
         }
     }
 }
@@ -157,6 +161,13 @@ cfg_io_driver! {
     }
 
     impl IoStack {
+        pub(crate) fn is_enabled(&self) -> bool {
+            match self {
+                IoStack::Enabled(..) => true,
+                IoStack::Disabled(..) => false,
+            }
+        }
+
         pub(crate) fn park(&mut self, handle: &Handle) {
             match self {
                 IoStack::Enabled(v) => v.park(handle),
@@ -219,6 +230,11 @@ cfg_not_io_driver! {
 
         pub(crate) fn shutdown(&mut self, _handle: &Handle) {
             self.0.shutdown();
+        }
+
+        /// This is not a "real" driver, so it is not considered enabled.
+        pub(crate) fn is_enabled(&self) -> bool {
+            false
         }
     }
 }
@@ -289,7 +305,7 @@ cfg_time! {
     fn create_time_driver(
         enable: bool,
         io_stack: IoStack,
-        clock: Clock,
+        clock: &Clock,
     ) -> (TimeDriver, TimeHandle) {
         if enable {
             let (driver, handle) = crate::runtime::time::Driver::new(io_stack, clock);
@@ -301,6 +317,13 @@ cfg_time! {
     }
 
     impl TimeDriver {
+        pub(crate) fn is_enabled(&self) -> bool {
+            match self {
+                TimeDriver::Enabled { .. } => true,
+                TimeDriver::Disabled(inner) => inner.is_enabled(),
+            }
+        }
+
         pub(crate) fn park(&mut self, handle: &Handle) {
             match self {
                 TimeDriver::Enabled { driver, .. } => driver.park(handle),
@@ -337,7 +360,7 @@ cfg_not_time! {
     fn create_time_driver(
         _enable: bool,
         io_stack: IoStack,
-        _clock: Clock,
+        _clock: &Clock,
     ) -> (TimeDriver, TimeHandle) {
         (io_stack, ())
     }

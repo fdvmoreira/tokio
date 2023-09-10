@@ -2,13 +2,13 @@
 #![allow(clippy::disallowed_names)]
 use std::sync::Arc;
 
-#[cfg(tokio_wasm_not_wasi)]
+#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
 #[cfg(target_pointer_width = "64")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
-#[cfg(tokio_wasm_not_wasi)]
+#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
 use wasm_bindgen_test::wasm_bindgen_test as maybe_tokio_test;
 
-#[cfg(not(tokio_wasm_not_wasi))]
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
 use tokio::test as maybe_tokio_test;
 
 use tokio::sync::{oneshot, Semaphore};
@@ -152,4 +152,10 @@ async fn a_different_future_is_polled_first_every_time_poll_fn_is_polled() {
         vec![1, 2, 3, 2, 3, 1, 3, 1, 2, 1, 2, 3],
         *poll_order.lock().unwrap()
     );
+}
+
+#[tokio::test]
+#[allow(clippy::unit_cmp)]
+async fn empty_join() {
+    assert_eq!(tokio::join!(), ());
 }

@@ -10,24 +10,75 @@
 //!
 //! [`channel`] returns a [`Sender`] / [`Receiver`] pair. These are the producer
 //! and consumer halves of the channel. The channel is created with an initial
-//! value. The **latest** value stored in the channel is accessed with
-//! [`Receiver::borrow()`]. Awaiting [`Receiver::changed()`] waits for a new
-//! value to be sent by the [`Sender`] half.
+//! value.
+//!
+//! Each [`Receiver`] independently tracks the last value *seen* by its caller.
+//!
+//! To access the **current** value stored in the channel and mark it as *seen*
+//! by a given [`Receiver`], use [`Receiver::borrow_and_update()`].
+//!
+//! To access the current value **without** marking it as *seen*, use
+//! [`Receiver::borrow()`]. (If the value has already been marked *seen*,
+//! [`Receiver::borrow()`] is equivalent to [`Receiver::borrow_and_update()`].)
+//!
+//! For more information on when to use these methods, see
+//! [here](#borrow_and_update-versus-borrow).
+//!
+//! ## Change notifications
+//!
+//! The [`Receiver`] half provides an asynchronous [`changed`] method. This
+//! method is ready when a new, *unseen* value is sent via the [`Sender`] half.
+//!
+//! * [`Receiver::changed()`] returns `Ok(())` on receiving a new value, or
+//!   `Err(`[`error::RecvError`]`)` if the [`Sender`] has been dropped.
+//! * If the current value is *unseen* when calling [`changed`], then
+//!   [`changed`] will return immediately. If the current value is *seen*, then
+//!   it will sleep until either a new message is sent via the [`Sender`] half,
+//!   or the [`Sender`] is dropped.
+//! * On completion, the [`changed`] method marks the new value as *seen*.
+//! * At creation, the initial value is considered *seen*. In other words,
+//!   [`Receiver::changed()`] will not return until a subsequent value is sent.
+//! * New [`Receiver`] instances can be created with [`Sender::subscribe()`].
+//!   The current value at the time the [`Receiver`] is created is considered
+//!   *seen*.
+//!
+//! ## `borrow_and_update` versus `borrow`
+//!
+//! If the receiver intends to await notifications from [`changed`] in a loop,
+//! [`Receiver::borrow_and_update()`] should be preferred over
+//! [`Receiver::borrow()`].  This avoids a potential race where a new value is
+//! sent between [`changed`] being ready and the value being read. (If
+//! [`Receiver::borrow()`] is used, the loop may run twice with the same value.)
+//!
+//! If the receiver is only interested in the current value, and does not intend
+//! to wait for changes, then [`Receiver::borrow()`] can be used. It may be more
+//! convenient to use [`borrow`](Receiver::borrow) since it's an `&self`
+//! method---[`borrow_and_update`](Receiver::borrow_and_update) requires `&mut
+//! self`.
 //!
 //! # Examples
 //!
+//! The following example prints `hello! world! `.
+//!
 //! ```
 //! use tokio::sync::watch;
+//! use tokio::time::{Duration, sleep};
 //!
 //! # async fn dox() -> Result<(), Box<dyn std::error::Error>> {
 //! let (tx, mut rx) = watch::channel("hello");
 //!
 //! tokio::spawn(async move {
-//!     while rx.changed().await.is_ok() {
-//!         println!("received = {:?}", *rx.borrow());
+//!     // Use the equivalent of a "do-while" loop so the initial value is
+//!     // processed before awaiting the `changed()` future.
+//!     loop {
+//!         println!("{}! ", *rx.borrow_and_update());
+//!         if rx.changed().await.is_err() {
+//!             break;
+//!         }
 //!     }
 //! });
 //!
+//! sleep(Duration::from_millis(100)).await;
 //! tx.send("world")?;
 //! # Ok(())
 //! # }
@@ -39,6 +90,9 @@
 //! when all [`Receiver`] handles have been dropped. This indicates that there
 //! is no further interest in the values being produced and work can be stopped.
 //!
+//! The value in the channel will not be dropped until the sender and all
+//! receivers have been dropped.
+//!
 //! # Thread safety
 //!
 //! Both [`Sender`] and [`Receiver`] are thread safe. They can be moved to other
@@ -47,17 +101,22 @@
 //!
 //! [`Sender`]: crate::sync::watch::Sender
 //! [`Receiver`]: crate::sync::watch::Receiver
+//! [`changed`]: crate::sync::watch::Receiver::changed
 //! [`Receiver::changed()`]: crate::sync::watch::Receiver::changed
 //! [`Receiver::borrow()`]: crate::sync::watch::Receiver::borrow
+//! [`Receiver::borrow_and_update()`]:
+//!     crate::sync::watch::Receiver::borrow_and_update
 //! [`channel`]: crate::sync::watch::channel
 //! [`Sender::is_closed`]: crate::sync::watch::Sender::is_closed
 //! [`Sender::closed`]: crate::sync::watch::Sender::closed
+//! [`Sender::subscribe()`]: crate::sync::watch::Sender::subscribe
 
 use crate::sync::notify::Notify;
 
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::atomic::Ordering::Relaxed;
 use crate::loom::sync::{Arc, RwLock, RwLockReadGuard};
+use std::fmt;
 use std::mem;
 use std::ops;
 use std::panic;
@@ -166,7 +225,6 @@ impl<'a, T> Ref<'a, T> {
     }
 }
 
-#[derive(Debug)]
 struct Shared<T> {
     /// The most recent value.
     value: RwLock<T>,
@@ -181,30 +239,49 @@ struct Shared<T> {
     ref_count_rx: AtomicUsize,
 
     /// Notifies waiting receivers that the value changed.
-    notify_rx: Notify,
+    notify_rx: big_notify::BigNotify,
 
     /// Notifies any task listening for `Receiver` dropped events.
     notify_tx: Notify,
 }
 
+impl<T: fmt::Debug> fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.load();
+        f.debug_struct("Shared")
+            .field("value", &self.value)
+            .field("version", &state.version())
+            .field("is_closed", &state.is_closed())
+            .field("ref_count_rx", &self.ref_count_rx)
+            .finish()
+    }
+}
+
 pub mod error {
     //! Watch error types.
 
+    use std::error::Error;
     use std::fmt;
 
     /// Error produced when sending a value fails.
-    #[derive(Debug)]
+    #[derive(PartialEq, Eq, Clone, Copy)]
     pub struct SendError<T>(pub T);
 
     // ===== impl SendError =====
 
-    impl<T: fmt::Debug> fmt::Display for SendError<T> {
+    impl<T> fmt::Debug for SendError<T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("SendError").finish_non_exhaustive()
+        }
+    }
+
+    impl<T> fmt::Display for SendError<T> {
         fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(fmt, "channel closed")
         }
     }
 
-    impl<T: fmt::Debug> std::error::Error for SendError<T> {}
+    impl<T> Error for SendError<T> {}
 
     /// Error produced when receiving a change notification.
     #[derive(Debug, Clone)]
@@ -218,7 +295,63 @@ pub mod error {
         }
     }
 
-    impl std::error::Error for RecvError {}
+    impl Error for RecvError {}
+}
+
+mod big_notify {
+    use super::*;
+    use crate::sync::notify::Notified;
+
+    // To avoid contention on the lock inside the `Notify`, we store multiple
+    // copies of it. Then, we use either circular access or randomness to spread
+    // out threads over different `Notify` objects.
+    //
+    // Some simple benchmarks show that randomness performs slightly better than
+    // circular access (probably due to contention on `next`), so we prefer to
+    // use randomness when Tokio is compiled with a random number generator.
+    //
+    // When the random number generator is not available, we fall back to
+    // circular access.
+
+    pub(super) struct BigNotify {
+        #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
+        next: AtomicUsize,
+        inner: [Notify; 8],
+    }
+
+    impl BigNotify {
+        pub(super) fn new() -> Self {
+            Self {
+                #[cfg(not(all(
+                    not(loom),
+                    feature = "sync",
+                    any(feature = "rt", feature = "macros")
+                )))]
+                next: AtomicUsize::new(0),
+                inner: Default::default(),
+            }
+        }
+
+        pub(super) fn notify_waiters(&self) {
+            for notify in &self.inner {
+                notify.notify_waiters();
+            }
+        }
+
+        /// This function implements the case where randomness is not available.
+        #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
+        pub(super) fn notified(&self) -> Notified<'_> {
+            let i = self.next.fetch_add(1, Relaxed) % 8;
+            self.inner[i].notified()
+        }
+
+        /// This function implements the case where randomness is available.
+        #[cfg(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros")))]
+        pub(super) fn notified(&self) -> Notified<'_> {
+            let i = crate::runtime::context::thread_rng_n(8) as usize;
+            self.inner[i].notified()
+        }
+    }
 }
 
 use self::state::{AtomicState, Version};
@@ -296,19 +429,28 @@ mod state {
 ///
 /// # Examples
 ///
+/// The following example prints `hello! world! `.
+///
 /// ```
 /// use tokio::sync::watch;
+/// use tokio::time::{Duration, sleep};
 ///
 /// # async fn dox() -> Result<(), Box<dyn std::error::Error>> {
-///     let (tx, mut rx) = watch::channel("hello");
+/// let (tx, mut rx) = watch::channel("hello");
 ///
-///     tokio::spawn(async move {
-///         while rx.changed().await.is_ok() {
-///             println!("received = {:?}", *rx.borrow());
+/// tokio::spawn(async move {
+///     // Use the equivalent of a "do-while" loop so the initial value is
+///     // processed before awaiting the `changed()` future.
+///     loop {
+///         println!("{}! ", *rx.borrow_and_update());
+///         if rx.changed().await.is_err() {
+///             break;
 ///         }
-///     });
+///     }
+/// });
 ///
-///     tx.send("world")?;
+/// sleep(Duration::from_millis(100)).await;
+/// tx.send("world")?;
 /// # Ok(())
 /// # }
 /// ```
@@ -320,7 +462,7 @@ pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
         value: RwLock::new(init),
         state: AtomicState::new(),
         ref_count_rx: AtomicUsize::new(1),
-        notify_rx: Notify::new(),
+        notify_rx: big_notify::BigNotify::new(),
         notify_tx: Notify::new(),
     });
 
@@ -375,7 +517,11 @@ impl<T> Receiver<T> {
     /// ```
     /// </details>
     ///
+    /// For more information on when to use this method versus
+    /// [`borrow_and_update`], see [here](self#borrow_and_update-versus-borrow).
+    ///
     /// [`changed`]: Receiver::changed
+    /// [`borrow_and_update`]: Receiver::borrow_and_update
     ///
     /// # Examples
     ///
@@ -427,7 +573,11 @@ impl<T> Receiver<T> {
     /// ```
     /// </details>
     ///
+    /// For more information on when to use this method versus [`borrow`], see
+    /// [here](self#borrow_and_update-versus-borrow).
+    ///
     /// [`changed`]: Receiver::changed
+    /// [`borrow`]: Receiver::borrow
     pub fn borrow_and_update(&mut self) -> Ref<'_, T> {
         let inner = self.shared.value.read().unwrap();
 
@@ -494,6 +644,9 @@ impl<T> Receiver<T> {
     ///
     /// This method returns an error if and only if the [`Sender`] is dropped.
     ///
+    /// For more information, see
+    /// [*Change notifications*](self#change-notifications) in the module-level documentation.
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe. If you use it as the event in a
@@ -517,25 +670,100 @@ impl<T> Receiver<T> {
     ///     });
     ///
     ///     assert!(rx.changed().await.is_ok());
-    ///     assert_eq!(*rx.borrow(), "goodbye");
+    ///     assert_eq!(*rx.borrow_and_update(), "goodbye");
     ///
     ///     // The `tx` handle has been dropped
     ///     assert!(rx.changed().await.is_err());
     /// }
     /// ```
     pub async fn changed(&mut self) -> Result<(), error::RecvError> {
-        loop {
-            // In order to avoid a race condition, we first request a notification,
-            // **then** check the current value's version. If a new version exists,
-            // the notification request is dropped.
-            let notified = self.shared.notify_rx.notified();
+        changed_impl(&self.shared, &mut self.version).await
+    }
 
-            if let Some(ret) = maybe_changed(&self.shared, &mut self.version) {
-                return ret;
+    /// Waits for a value that satisifes the provided condition.
+    ///
+    /// This method will call the provided closure whenever something is sent on
+    /// the channel. Once the closure returns `true`, this method will return a
+    /// reference to the value that was passed to the closure.
+    ///
+    /// Before `wait_for` starts waiting for changes, it will call the closure
+    /// on the current value. If the closure returns `true` when given the
+    /// current value, then `wait_for` will immediately return a reference to
+    /// the current value. This is the case even if the current value is already
+    /// considered seen.
+    ///
+    /// The watch channel only keeps track of the most recent value, so if
+    /// several messages are sent faster than `wait_for` is able to call the
+    /// closure, then it may skip some updates. Whenever the closure is called,
+    /// it will be called with the most recent value.
+    ///
+    /// When this function returns, the value that was passed to the closure
+    /// when it returned `true` will be considered seen.
+    ///
+    /// If the channel is closed, then `wait_for` will return a `RecvError`.
+    /// Once this happens, no more messages can ever be sent on the channel.
+    /// When an error is returned, it is guaranteed that the closure has been
+    /// called on the last value, and that it returned `false` for that value.
+    /// (If the closure returned `true`, then the last value would have been
+    /// returned instead of the error.)
+    ///
+    /// Like the `borrow` method, the returned borrow holds a read lock on the
+    /// inner value. This means that long-lived borrows could cause the producer
+    /// half to block. It is recommended to keep the borrow as short-lived as
+    /// possible. See the documentation of `borrow` for more information on
+    /// this.
+    ///
+    /// [`Receiver::changed()`]: crate::sync::watch::Receiver::changed
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::watch;
+    ///
+    /// #[tokio::main]
+    ///
+    /// async fn main() {
+    ///     let (tx, _rx) = watch::channel("hello");
+    ///
+    ///     tx.send("goodbye").unwrap();
+    ///
+    ///     // here we subscribe to a second receiver
+    ///     // now in case of using `changed` we would have
+    ///     // to first check the current value and then wait
+    ///     // for changes or else `changed` would hang.
+    ///     let mut rx2 = tx.subscribe();
+    ///
+    ///     // in place of changed we have use `wait_for`
+    ///     // which would automatically check the current value
+    ///     // and wait for changes until the closure returns true.
+    ///     assert!(rx2.wait_for(|val| *val == "goodbye").await.is_ok());
+    ///     assert_eq!(*rx2.borrow(), "goodbye");
+    /// }
+    /// ```
+    pub async fn wait_for(
+        &mut self,
+        mut f: impl FnMut(&T) -> bool,
+    ) -> Result<Ref<'_, T>, error::RecvError> {
+        let mut closed = false;
+        loop {
+            {
+                let inner = self.shared.value.read().unwrap();
+
+                let new_version = self.shared.state.load().version();
+                let has_changed = self.version != new_version;
+                self.version = new_version;
+
+                if (!closed || has_changed) && f(&inner) {
+                    return Ok(Ref { inner, has_changed });
+                }
             }
 
-            notified.await;
-            // loop around again in case the wake-up was spurious
+            if closed {
+                return Err(error::RecvError(()));
+            }
+
+            // Wait for the value to change.
+            closed = changed_impl(&self.shared, &mut self.version).await.is_err();
         }
     }
 
@@ -582,6 +810,27 @@ fn maybe_changed<T>(
     }
 
     None
+}
+
+async fn changed_impl<T>(
+    shared: &Shared<T>,
+    version: &mut Version,
+) -> Result<(), error::RecvError> {
+    crate::trace::async_trace_leaf().await;
+
+    loop {
+        // In order to avoid a race condition, we first request a notification,
+        // **then** check the current value's version. If a new version exists,
+        // the notification request is dropped.
+        let notified = shared.notify_rx.notified();
+
+        if let Some(ret) = maybe_changed(shared, version) {
+            return ret;
+        }
+
+        notified.await;
+        // loop around again in case the wake-up was spurious
+    }
 }
 
 impl<T> Clone for Receiver<T> {
@@ -636,7 +885,7 @@ impl<T> Sender<T> {
     /// Modifies the watched value **unconditionally** in-place,
     /// notifying all receivers.
     ///
-    /// This can useful for modifying the watched value, without
+    /// This can be useful for modifying the watched value, without
     /// having to allocate a new instance. Additionally, this
     /// method permits sending values even when there are no receivers.
     ///
@@ -676,7 +925,7 @@ impl<T> Sender<T> {
     /// Modifies the watched value **conditionally** in-place,
     /// notifying all receivers only if modified.
     ///
-    /// This can useful for modifying the watched value, without
+    /// This can be useful for modifying the watched value, without
     /// having to allocate a new instance. Additionally, this
     /// method permits sending values even when there are no receivers.
     ///
@@ -867,6 +1116,8 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub async fn closed(&self) {
+        crate::trace::async_trace_leaf().await;
+
         while self.receiver_count() > 0 {
             let notified = self.shared.notify_tx.notified();
 

@@ -383,7 +383,7 @@
 //!                         sleep.set(time::sleep_until(op_start + conf.timeout));
 //!                     }
 //!                     _ = rx.changed() => {
-//!                         conf = rx.borrow().clone();
+//!                         conf = rx.borrow_and_update().clone();
 //!
 //!                         // The configuration has been updated. Update the
 //!                         // `sleep` using the new `timeout` value.
@@ -449,7 +449,7 @@ cfg_sync! {
     pub mod mpsc;
 
     mod mutex;
-    pub use mutex::{Mutex, MutexGuard, TryLockError, OwnedMutexGuard, MappedMutexGuard};
+    pub use mutex::{Mutex, MutexGuard, TryLockError, OwnedMutexGuard, MappedMutexGuard, OwnedMappedMutexGuard};
 
     pub(crate) mod notify;
     pub use notify::Notify;

@@ -2,11 +2,14 @@
 name = "benches"
 version = "0.0.0"
 publish = false
-edition = "2018"
+edition = "2021"
+
+[features]
+test-util = ["tokio/test-util"]
 
 [dependencies]
 tokio = { version = "1.5.0", path = "../tokio", features = ["full"] }
-bencher = "0.1.5"
+criterion = "0.5.1"
 rand = "0.8"
 rand_chacha = "0.3"
 
@@ -28,10 +31,29 @@ path = "sync_mpsc.rs"
 harness = false
 
 [[bench]]
+name = "sync_mpsc_oneshot"
+path = "sync_mpsc_oneshot.rs"
+harness = false
+
+[[bench]]
+name = "sync_watch"
+path = "sync_watch.rs"
+harness = false
+
+[[bench]]
+name = "rt_current_thread"
+path = "rt_current_thread.rs"
+harness = false
+
+[[bench]]
 name = "rt_multi_threaded"
 path = "rt_multi_threaded.rs"
 harness = false
 
+[[bench]]
+name = "sync_notify"
+path = "sync_notify.rs"
+harness = false
 
 [[bench]]
 name = "sync_rwlock"
@@ -56,4 +78,9 @@ harness = false
 [[bench]]
 name = "copy"
 path = "copy.rs"
+harness = false
+
+[[bench]]
+name = "time_now"
+path = "time_now.rs"
 harness = false

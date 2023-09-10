@@ -178,20 +178,42 @@ impl Semaphore {
     /// Creates a new semaphore with the initial number of permits.
     ///
     /// Maximum number of permits on 32-bit platforms is `1<<29`.
-    ///
-    /// If the specified number of permits exceeds the maximum permit amount
-    /// Then the value will get clamped to the maximum number of permits.
-    #[cfg(all(feature = "parking_lot", not(all(loom, test))))]
-    pub(crate) const fn const_new(mut permits: usize) -> Self {
-        // NOTE: assertions and by extension panics are still being worked on: https://github.com/rust-lang/rust/issues/74925
-        // currently we just clamp the permit count when it exceeds the max
-        permits &= Self::MAX_PERMITS;
+    #[cfg(not(all(loom, test)))]
+    pub(crate) const fn const_new(permits: usize) -> Self {
+        assert!(permits <= Self::MAX_PERMITS);
 
         Self {
             permits: AtomicUsize::new(permits << Self::PERMIT_SHIFT),
             waiters: Mutex::const_new(Waitlist {
                 queue: LinkedList::new(),
                 closed: false,
+            }),
+            #[cfg(all(tokio_unstable, feature = "tracing"))]
+            resource_span: tracing::Span::none(),
+        }
+    }
+
+    /// Creates a new closed semaphore with 0 permits.
+    pub(crate) fn new_closed() -> Self {
+        Self {
+            permits: AtomicUsize::new(Self::CLOSED),
+            waiters: Mutex::new(Waitlist {
+                queue: LinkedList::new(),
+                closed: true,
+            }),
+            #[cfg(all(tokio_unstable, feature = "tracing"))]
+            resource_span: tracing::Span::none(),
+        }
+    }
+
+    /// Creates a new closed semaphore with 0 permits.
+    #[cfg(not(all(loom, test)))]
+    pub(crate) const fn const_new_closed() -> Self {
+        Self {
+            permits: AtomicUsize::new(Self::CLOSED),
+            waiters: Mutex::const_new(Waitlist {
+                queue: LinkedList::new(),
+                closed: true,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             resource_span: tracing::Span::none(),
@@ -264,7 +286,7 @@ impl Semaphore {
 
             match self.permits.compare_exchange(curr, next, AcqRel, Acquire) {
                 Ok(_) => {
-                    // TODO: Instrument once issue has been solved}
+                    // TODO: Instrument once issue has been solved
                     return Ok(());
                 }
                 Err(actual) => curr = actual,
@@ -444,6 +466,7 @@ impl Semaphore {
         }
 
         assert_eq!(acquired, 0);
+        let mut old_waker = None;
 
         // Otherwise, register the waker & enqueue the node.
         node.waker.with_mut(|waker| {
@@ -455,7 +478,7 @@ impl Semaphore {
                 .map(|waker| !waker.will_wake(cx.waker()))
                 .unwrap_or(true)
             {
-                *waker = Some(cx.waker().clone());
+                old_waker = std::mem::replace(waker, Some(cx.waker().clone()));
             }
         });
 
@@ -468,6 +491,8 @@ impl Semaphore {
 
             waiters.queue.push_front(node);
         }
+        drop(waiters);
+        drop(old_waker);
 
         Pending
     }
