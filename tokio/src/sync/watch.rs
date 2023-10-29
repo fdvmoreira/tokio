@@ -299,7 +299,7 @@ pub mod error {
 }
 
 mod big_notify {
-    use super::*;
+    use super::Notify;
     use crate::sync::notify::Notified;
 
     // To avoid contention on the lock inside the `Notify`, we store multiple
@@ -315,7 +315,7 @@ mod big_notify {
 
     pub(super) struct BigNotify {
         #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
-        next: AtomicUsize,
+        next: std::sync::atomic::AtomicUsize,
         inner: [Notify; 8],
     }
 
@@ -327,7 +327,7 @@ mod big_notify {
                     feature = "sync",
                     any(feature = "rt", feature = "macros")
                 )))]
-                next: AtomicUsize::new(0),
+                next: std::sync::atomic::AtomicUsize::new(0),
                 inner: Default::default(),
             }
         }
@@ -341,7 +341,7 @@ mod big_notify {
         /// This function implements the case where randomness is not available.
         #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
         pub(super) fn notified(&self) -> Notified<'_> {
-            let i = self.next.fetch_add(1, Relaxed) % 8;
+            let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8;
             self.inner[i].notified()
         }
 
@@ -357,9 +357,12 @@ mod big_notify {
 use self::state::{AtomicState, Version};
 mod state {
     use crate::loom::sync::atomic::AtomicUsize;
-    use crate::loom::sync::atomic::Ordering::SeqCst;
+    use crate::loom::sync::atomic::Ordering;
 
-    const CLOSED: usize = 1;
+    const CLOSED_BIT: usize = 1;
+
+    // Using 2 as the step size preserves the `CLOSED_BIT`.
+    const STEP_SIZE: usize = 2;
 
     /// The version part of the state. The lowest bit is always zero.
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -374,49 +377,69 @@ mod state {
     pub(super) struct StateSnapshot(usize);
 
     /// The state stored in an atomic integer.
+    ///
+    /// The `Sender` uses `Release` ordering for storing a new state
+    /// and the `Receiver`s use `Acquire` ordering for loading the
+    /// current state. This ensures that written values are seen by
+    /// the `Receiver`s for a proper handover.
     #[derive(Debug)]
     pub(super) struct AtomicState(AtomicUsize);
 
     impl Version {
-        /// Get the initial version when creating the channel.
-        pub(super) fn initial() -> Self {
-            Version(0)
+        /// Decrements the version.
+        pub(super) fn decrement(&mut self) {
+            // Using a wrapping decrement here is required to ensure that the
+            // operation is consistent with `std::sync::atomic::AtomicUsize::fetch_add()`
+            // which wraps on overflow.
+            self.0 = self.0.wrapping_sub(STEP_SIZE);
         }
+
+        pub(super) const INITIAL: Self = Version(0);
     }
 
     impl StateSnapshot {
         /// Extract the version from the state.
         pub(super) fn version(self) -> Version {
-            Version(self.0 & !CLOSED)
+            Version(self.0 & !CLOSED_BIT)
         }
 
         /// Is the closed bit set?
         pub(super) fn is_closed(self) -> bool {
-            (self.0 & CLOSED) == CLOSED
+            (self.0 & CLOSED_BIT) == CLOSED_BIT
         }
     }
 
     impl AtomicState {
         /// Create a new `AtomicState` that is not closed and which has the
-        /// version set to `Version::initial()`.
+        /// version set to `Version::INITIAL`.
         pub(super) fn new() -> Self {
-            AtomicState(AtomicUsize::new(0))
+            AtomicState(AtomicUsize::new(Version::INITIAL.0))
         }
 
         /// Load the current value of the state.
+        ///
+        /// Only used by the receiver and for debugging purposes.
+        ///
+        /// The receiver side (read-only) uses `Acquire` ordering for a proper handover
+        /// of the shared value with the sender side (single writer). The state is always
+        /// updated after modifying and before releasing the (exclusive) lock on the
+        /// shared value.
         pub(super) fn load(&self) -> StateSnapshot {
-            StateSnapshot(self.0.load(SeqCst))
+            StateSnapshot(self.0.load(Ordering::Acquire))
         }
 
         /// Increment the version counter.
-        pub(super) fn increment_version(&self) {
-            // Increment by two to avoid touching the CLOSED bit.
-            self.0.fetch_add(2, SeqCst);
+        pub(super) fn increment_version_while_locked(&self) {
+            // Use `Release` ordering to ensure that the shared value
+            // has been written before updating the version. The shared
+            // value is still protected by an exclusive lock during this
+            // method.
+            self.0.fetch_add(STEP_SIZE, Ordering::Release);
         }
 
         /// Set the closed bit in the state.
         pub(super) fn set_closed(&self) {
-            self.0.fetch_or(CLOSED, SeqCst);
+            self.0.fetch_or(CLOSED_BIT, Ordering::Release);
         }
     }
 }
@@ -472,7 +495,7 @@ pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
 
     let rx = Receiver {
         shared,
-        version: Version::initial(),
+        version: Version::INITIAL,
     };
 
     (tx, rx)
@@ -634,6 +657,18 @@ impl<T> Receiver<T> {
         Ok(self.version != new_version)
     }
 
+    /// Marks the state as changed.
+    ///
+    /// After invoking this method [`has_changed()`](Self::has_changed)
+    /// returns `true` and [`changed()`](Self::changed) returns
+    /// immediately, regardless of whether a new value has been sent.
+    ///
+    /// This is useful for triggering an initial change notification after
+    /// subscribing to synchronize new receivers.
+    pub fn mark_changed(&mut self) {
+        self.version.decrement();
+    }
+
     /// Waits for a change notification, then marks the newest value as seen.
     ///
     /// If the newest value in the channel has not yet been marked seen when
@@ -680,7 +715,7 @@ impl<T> Receiver<T> {
         changed_impl(&self.shared, &mut self.version).await
     }
 
-    /// Waits for a value that satisifes the provided condition.
+    /// Waits for a value that satisfies the provided condition.
     ///
     /// This method will call the provided closure whenever something is sent on
     /// the channel. Once the closure returns `true`, this method will return a
@@ -753,8 +788,23 @@ impl<T> Receiver<T> {
                 let has_changed = self.version != new_version;
                 self.version = new_version;
 
-                if (!closed || has_changed) && f(&inner) {
-                    return Ok(Ref { inner, has_changed });
+                if !closed || has_changed {
+                    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| f(&inner)));
+                    match result {
+                        Ok(true) => {
+                            return Ok(Ref { inner, has_changed });
+                        }
+                        Ok(false) => {
+                            // Skip the value.
+                        }
+                        Err(panicked) => {
+                            // Drop the read-lock to avoid poisoning it.
+                            drop(inner);
+                            // Forward the panic to the caller.
+                            panic::resume_unwind(panicked);
+                            // Unreachable
+                        }
+                    };
                 }
             }
 
@@ -805,7 +855,7 @@ fn maybe_changed<T>(
     }
 
     if state.is_closed() {
-        // All receivers have dropped.
+        // The sender has been dropped.
         return Some(Err(error::RecvError(())));
     }
 
@@ -854,6 +904,27 @@ impl<T> Drop for Receiver<T> {
 }
 
 impl<T> Sender<T> {
+    /// Creates the sending-half of the [`watch`] channel.
+    ///
+    /// See documentation of [`watch::channel`] for errors when calling this function.
+    /// Beware that attempting to send a value when there are no receivers will
+    /// return an error.
+    ///
+    /// [`watch`]: crate::sync::watch
+    /// [`watch::channel`]: crate::sync::watch
+    ///
+    /// # Examples
+    /// ```
+    /// let sender = tokio::sync::watch::Sender::new(0u8);
+    /// assert!(sender.send(3).is_err());
+    /// let _rec = sender.subscribe();
+    /// assert!(sender.send(4).is_ok());
+    /// ```
+    pub fn new(init: T) -> Self {
+        let (tx, _) = channel(init);
+        tx
+    }
+
     /// Sends a new value via the channel, notifying all receivers.
     ///
     /// This method fails if the channel is closed, which is the case when
@@ -1006,7 +1077,7 @@ impl<T> Sender<T> {
                 }
             };
 
-            self.shared.state.increment_version();
+            self.shared.state.increment_version_while_locked();
 
             // Release the write lock.
             //
